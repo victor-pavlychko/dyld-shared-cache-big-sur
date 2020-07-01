@@ -40,7 +40,7 @@
 #include "CodeSigningTypes.h"
 #include <CommonCrypto/CommonHMAC.h>
 #include <CommonCrypto/CommonDigest.h>
-#include <CommonCrypto/CommonDigestSPI.h>
+//#include <CommonCrypto/CommonDigestSPI.h>
 
 #define NO_ULEB
 #include "Architectures.hpp"
@@ -667,57 +667,57 @@ static int sharedCacheIsValid(const void* mapped_cache, uint64_t size) {
         return -1;
     }
 
-    uint32_t dscDigestFormat = kCCDigestNone;
-    switch (cd->hashType) {
-        case CS_HASHTYPE_SHA1:
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wdeprecated-declarations"
-            dscDigestFormat = kCCDigestSHA1;
-#pragma clang diagnostic pop
-            break;
-        case CS_HASHTYPE_SHA256:
-            dscDigestFormat = kCCDigestSHA256;
-            break;
-        default:
-            break;
-    }
-
-    if (dscDigestFormat != kCCDigestNone) {
-        const uint64_t csPageSize = 1 << cd->pageSize;
-        size_t   hashOffset = ntohl(cd->hashOffset);
-        uint8_t* hashSlot = (uint8_t*)cd + hashOffset;
-        uint8_t cdHashBuffer[cd->hashSize];
-
-        // Skip local symbols for now as those aren't being codesign correctly right now.
-        size_t inBbufferSize = 0;
-        for (auto& sharedCacheRegion : sharedCacheRegions) {
-            if (sharedCacheRegion.first == dyldSharedCache->header.localSymbolsOffset)
-                continue;
-            inBbufferSize += (sharedCacheRegion.second - sharedCacheRegion.first);
-        }
-        uint32_t slotCountToProcess = (uint32_t)((inBbufferSize + pageSize - 1) / pageSize);
-
-        for (unsigned i = 0; i != slotCountToProcess; ++i) {
-            // Skip data pages as those may have been slid by ASLR in the extracted file
-            uint64_t fileOffset = i * csPageSize;
-            bool isDataPage = false;
-            for (unsigned mappingIndex = 1; mappingIndex != (dyldSharedCache->header.mappingCount - 1); ++mappingIndex) {
-                if ( (fileOffset >= mappings[mappingIndex].fileOffset) && (fileOffset < (mappings[mappingIndex].fileOffset + mappings[mappingIndex].size)) ) {
-                    isDataPage = true;
-                    break;
-                }
-            }
-            if ( isDataPage )
-                continue;
-
-            CCDigest(dscDigestFormat, (uint8_t*)mapped_cache + fileOffset, (size_t)csPageSize, cdHashBuffer);
-            uint8_t* cacheCdHashBuffer = hashSlot + (i * cd->hashSize);
-            if (memcmp(cdHashBuffer, cacheCdHashBuffer, cd->hashSize) != 0)  {
-                fprintf(stderr, "Error: dyld shared cache code signature for page %d is incorrect.\n", i);
-                return -1;
-            }
-        }
-    }
+//    uint32_t dscDigestFormat = kCCDigestNone;
+//    switch (cd->hashType) {
+//        case CS_HASHTYPE_SHA1:
+//#pragma clang diagnostic push
+//#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+//            dscDigestFormat = kCCDigestSHA1;
+//#pragma clang diagnostic pop
+//            break;
+//        case CS_HASHTYPE_SHA256:
+//            dscDigestFormat = kCCDigestSHA256;
+//            break;
+//        default:
+//            break;
+//    }
+//
+//    if (dscDigestFormat != kCCDigestNone) {
+//        const uint64_t csPageSize = 1 << cd->pageSize;
+//        size_t   hashOffset = ntohl(cd->hashOffset);
+//        uint8_t* hashSlot = (uint8_t*)cd + hashOffset;
+//        uint8_t cdHashBuffer[cd->hashSize];
+//
+//        // Skip local symbols for now as those aren't being codesign correctly right now.
+//        size_t inBbufferSize = 0;
+//        for (auto& sharedCacheRegion : sharedCacheRegions) {
+//            if (sharedCacheRegion.first == dyldSharedCache->header.localSymbolsOffset)
+//                continue;
+//            inBbufferSize += (sharedCacheRegion.second - sharedCacheRegion.first);
+//        }
+//        uint32_t slotCountToProcess = (uint32_t)((inBbufferSize + pageSize - 1) / pageSize);
+//
+//        for (unsigned i = 0; i != slotCountToProcess; ++i) {
+//            // Skip data pages as those may have been slid by ASLR in the extracted file
+//            uint64_t fileOffset = i * csPageSize;
+//            bool isDataPage = false;
+//            for (unsigned mappingIndex = 1; mappingIndex != (dyldSharedCache->header.mappingCount - 1); ++mappingIndex) {
+//                if ( (fileOffset >= mappings[mappingIndex].fileOffset) && (fileOffset < (mappings[mappingIndex].fileOffset + mappings[mappingIndex].size)) ) {
+//                    isDataPage = true;
+//                    break;
+//                }
+//            }
+//            if ( isDataPage )
+//                continue;
+//
+//            CCDigest(dscDigestFormat, (uint8_t*)mapped_cache + fileOffset, (size_t)csPageSize, cdHashBuffer);
+//            uint8_t* cacheCdHashBuffer = hashSlot + (i * cd->hashSize);
+//            if (memcmp(cdHashBuffer, cacheCdHashBuffer, cd->hashSize) != 0)  {
+//                fprintf(stderr, "Error: dyld shared cache code signature for page %d is incorrect.\n", i);
+//                return -1;
+//            }
+//        }
+//    }
     return 0;
 }
 
