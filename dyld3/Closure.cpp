@@ -30,13 +30,13 @@
 #include <mach-o/dyld_priv.h>
 #include <sys/stat.h>
 #include <sys/sysctl.h>
-#include <System/machine/cpu_capabilities.h>
-#include <_simple.h>
+//#include <System/machine/cpu_capabilities.h>
+//#include <_simple.h>
 
-extern "C" {
-  #include <corecrypto/ccdigest.h>
-  #include <corecrypto/ccsha2.h>
-}
+//extern "C" {
+//  #include <corecrypto/ccdigest.h>
+//  #include <corecrypto/ccsha2.h>
+//}
 
 #include "Closure.h"
 #include "MachOFile.h"
@@ -1305,29 +1305,30 @@ void LaunchClosure::duplicateClassesHashTable(const ObjCClassDuplicatesOpt*& dup
 
 static bool getContainerLibraryCachesDir(const char* envp[], char libCacheDir[])
 {
-    // $HOME is root of writable data container
-    const char* homeDir = _simple_getenv(envp, "HOME");
-    if ( homeDir == nullptr )
-        return false;
-
-    // Use realpath to block malicious values like HOME=/tmp/../usr/bin
-    char realHomePath[PATH_MAX];
-    if ( realpath(homeDir, realHomePath) != nullptr )
-        homeDir = realHomePath;
-#if TARGET_OS_OSX
-    // <rdar://problem/66593232> iOS apps on Apple Silicon macOS have a different data container location
-    if ( strstr(homeDir, "/Library/Containers/") == nullptr )
-        return false;
-#else
-    // <rdar://problem/47688842> dyld3 should only save closures to disk for containerized apps
-    if ( strncmp(homeDir, "/private/var/mobile/Containers/Data/", 36) != 0 )
-        return false;
-#endif
-
-    // return $HOME/Library/Caches/
-    strlcpy(libCacheDir, homeDir, PATH_MAX);
-    strlcat(libCacheDir, "/Library/Caches", PATH_MAX);
-    return true;
+//    // $HOME is root of writable data container
+//    const char* homeDir = _simple_getenv(envp, "HOME");
+//    if ( homeDir == nullptr )
+//        return false;
+//
+//    // Use realpath to block malicious values like HOME=/tmp/../usr/bin
+//    char realHomePath[PATH_MAX];
+//    if ( realpath(homeDir, realHomePath) != nullptr )
+//        homeDir = realHomePath;
+//#if TARGET_OS_OSX
+//    // <rdar://problem/66593232> iOS apps on Apple Silicon macOS have a different data container location
+//    if ( strstr(homeDir, "/Library/Containers/") == nullptr )
+//        return false;
+//#else
+//    // <rdar://problem/47688842> dyld3 should only save closures to disk for containerized apps
+//    if ( strncmp(homeDir, "/private/var/mobile/Containers/Data/", 36) != 0 )
+//        return false;
+//#endif
+//
+//    // return $HOME/Library/Caches/
+//    strlcpy(libCacheDir, homeDir, PATH_MAX);
+//    strlcat(libCacheDir, "/Library/Caches", PATH_MAX);
+//    return true;
+    return false;
 }
 
 bool LaunchClosure::buildClosureCachePath(const char* mainExecutablePath, const char* envp[],
