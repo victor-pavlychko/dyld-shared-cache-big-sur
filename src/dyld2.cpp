@@ -33,7 +33,8 @@
 #include <libproc.h>
 #include <sys/param.h>
 #include <mach/mach_time.h> // mach_absolute_time()
-#include <mach/mach_init.h> 
+#include <mach/mach_init.h>
+#include <mach/mach_traps.h>
 #include <sys/types.h>
 #include <sys/stat.h> 
 #include <sys/syscall.h>
@@ -48,7 +49,6 @@
 #include <mach-o/ldsyms.h> 
 #include <libkern/OSByteOrder.h> 
 #include <libkern/OSAtomic.h>
-#include <mach/mach.h>
 #include <sys/sysctl.h>
 #include <sys/mman.h>
 #include <sys/dtrace.h>
@@ -65,7 +65,7 @@
 #include <sys/fsgetpath.h>
 #include <System/sys/content_protection.h>
 
-#define SUPPORT_LOGGING_TO_CONSOLE !(__i386__ || __x86_64__ || TARGET_OS_SIMULATOR)
+#define SUPPORT_LOGGING_TO_CONSOLE !TARGET_OS_SIMULATOR
 #if SUPPORT_LOGGING_TO_CONSOLE
 #include <paths.h> // for logging to console
 #endif
@@ -196,6 +196,8 @@ extern "C" {
 // magic linker symbol for start of dyld binary
 extern "C" const macho_header __dso_handle;
 
+extern bool gEnableSharedCacheDataConst;
+
 
 //
 // The file contains the core of dyld used to get a process to main().  
@@ -281,7 +283,8 @@ static uintptr_t					sMainExecutableSlide = 0;
 static cpu_type_t					sHostCPU;
 static cpu_subtype_t				sHostCPUsubtype;
 #endif
-static ImageLoaderMachO*			sMainExecutable = NULL;
+typedef ImageLoaderMachO* __ptrauth_dyld_address_auth MainExecutablePointerType;
+static MainExecutablePointerType	sMainExecutable = NULL;
 static size_t						sInsertedDylibCount = 0;
 static std::vector<ImageLoader*>	sAllImages;
 static std::vector<ImageLoader*>	sImageRoots;
@@ -866,98 +869,188 @@ static void notifySingleFromCache(dyld_image_states state, const mach_header* mh
 #endif
 
 #if !TARGET_OS_SIMULATOR
-static void sendMessage(unsigned portSlot, mach_msg_id_t msgId, mach_msg_size_t sendSize, mach_msg_header_t* buffer, mach_msg_size_t bufferSize) {
-	// Allocate a port to listen on in this monitoring task
-	mach_port_t sendPort = dyld::gProcessInfo->notifyPorts[portSlot];
-	if (sendPort == MACH_PORT_NULL) {
-		return;
-	}
-	mach_port_t replyPort = MACH_PORT_NULL;
-	mach_port_options_t options = { .flags = MPO_CONTEXT_AS_GUARD | MPO_STRICT,
-		.mpl = { 1 }};
-	kern_return_t kr = mach_port_construct(mach_task_self(), &options, (mach_port_context_t)&replyPort, &replyPort);
-	if (kr != KERN_SUCCESS) {
-		return;
-	}
-	// Assemble a message
-	mach_msg_header_t* h = buffer;
-	h->msgh_bits         = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND,MACH_MSG_TYPE_MAKE_SEND_ONCE);
-	h->msgh_id           = msgId;
-	h->msgh_local_port   = replyPort;
-	h->msgh_remote_port  = sendPort;
-	h->msgh_reserved     = 0;
-	h->msgh_size         = sendSize;
-	kr = mach_msg(h, MACH_SEND_MSG | MACH_RCV_MSG, h->msgh_size, bufferSize, replyPort, 0, MACH_PORT_NULL);
-	mach_msg_destroy(h);
-	if ( kr == MACH_SEND_INVALID_DEST ) {
-		if (OSAtomicCompareAndSwap32(sendPort, 0, (volatile int32_t*)&dyld::gProcessInfo->notifyPorts[portSlot])) {
-			mach_port_deallocate(mach_task_self(), sendPort);
+#define DYLD_PROCESS_INFO_NOTIFY_MAGIC 0x49414E46
+
+struct RemoteNotificationResponder {
+	RemoteNotificationResponder(const RemoteNotificationResponder&) = delete;
+	RemoteNotificationResponder(RemoteNotificationResponder&&) = delete;
+	RemoteNotificationResponder() {
+		if (dyld::gProcessInfo->notifyPorts[0] != DYLD_PROCESS_INFO_NOTIFY_MAGIC) {
+			// No notifier found, early out
+			_namesCnt = 0;
+			return;
+		}
+		kern_return_t kr = task_dyld_process_info_notify_get(_names, &_namesCnt);
+		while (kr == KERN_NO_SPACE) {
+			// In the future the SPI may return the size we need, but for now we just double the count. Since we don't want to depend on the
+			// return value in _nameCnt we set it to have a minimm of 16, double the inline storage value
+			_namesCnt = std::max<uint32_t>(16, 2*_namesCnt);
+			_namesSize = _namesCnt*sizeof(mach_port_t);
+			kr = vm_allocate(mach_task_self(), (vm_address_t*)&_names, _namesSize, VM_FLAGS_ANYWHERE);
+			if (kr != KERN_SUCCESS) {
+				// We could not allocate memory, time to error out
+				break;
+			}
+			kr = task_dyld_process_info_notify_get(_names, &_namesCnt);
+			if (kr != KERN_SUCCESS) {
+				// We failed, so deallocate the memory. If the failures was KERN_NO_SPACE we will loop back and try again
+				(void)vm_deallocate(mach_task_self(), (vm_address_t)_names, _namesSize);
+				_namesSize = 0;
+			}
+		}
+		if (kr != KERN_SUCCESS) {
+			// We failed, set _namesCnt to 0 so nothing else will happen
+			_namesCnt = 0;
 		}
 	}
-	mach_port_destruct(mach_task_self(), replyPort, 0, (mach_port_context_t)&replyPort);
+	~RemoteNotificationResponder() {
+		if (_namesCnt) {
+			for (auto i = 0; i < _namesCnt; ++i) {
+				(void)mach_port_deallocate(mach_task_self(), _names[i]);
+			}
+			if (_namesSize != 0) {
+				// We are not using inline memory, we need to free it
+				(void)vm_deallocate(mach_task_self(), (vm_address_t)_names, _namesSize);
+			}
+		}
+	}
+	void sendMessage(mach_msg_id_t msgId, mach_msg_size_t sendSize, mach_msg_header_t* buffer) {
+		if (_namesCnt == 0) { return; }
+		// Allocate a port to listen on in this monitoring task
+		mach_port_t replyPort = MACH_PORT_NULL;
+		mach_port_options_t options = { .flags = MPO_CONTEXT_AS_GUARD | MPO_STRICT, .mpl = { 1 }};
+		kern_return_t kr = mach_port_construct(mach_task_self(), &options, (mach_port_context_t)&replyPort, &replyPort);
+		if (kr != KERN_SUCCESS) {
+			return;
+		}
+		for (auto i = 0; i < _namesCnt; ++i) {
+			if (_names[i] == MACH_PORT_NULL) { continue; }
+			// Assemble a message
+			uint8_t replyBuffer[sizeof(mach_msg_header_t) + MAX_TRAILER_SIZE];
+			mach_msg_header_t* 	msg = buffer;
+			msg->msgh_bits         = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND,MACH_MSG_TYPE_MAKE_SEND_ONCE);
+			msg->msgh_id           = msgId;
+			msg->msgh_local_port   = replyPort;
+			msg->msgh_remote_port  = _names[i];
+			msg->msgh_reserved     = 0;
+			msg->msgh_size         = sendSize;
+			kr = mach_msg_overwrite(msg, MACH_SEND_MSG | MACH_RCV_MSG, msg->msgh_size, sizeof(replyBuffer), replyPort, 0, MACH_PORT_NULL,
+									 (mach_msg_header_t*)&replyBuffer[0], 0);
+			if (kr != KERN_SUCCESS) {
+				// Send failed, we may have been psuedo recieved. destroy the message
+				(void)mach_msg_destroy(msg);
+				// Mark the port as null. It does not matter why we failed... if it is s single message we will not retry, if it
+				// is a fragmented message then subsequent messages will not decode correctly
+				_names[i] = MACH_PORT_NULL;
+			}
+		}
+		(void)mach_port_destruct(mach_task_self(), replyPort, 0, (mach_port_context_t)&replyPort);
+	}
+
+	bool const active() const {
+		for (auto i = 0; i < _namesCnt; ++i) {
+			if (_names[i] != MACH_PORT_NULL) {
+				return true;
+			}
+		}
+		return false;
+	}
+private:
+	mach_port_t             _namesArray[8] = {0};
+	mach_port_name_array_t  _names = (mach_port_name_array_t)&_namesArray[0];
+	mach_msg_type_number_t  _namesCnt = 8;
+	vm_size_t               _namesSize = 0;
+};
+
+//FIXME: Remove this once we drop support for iOS 11 simulators
+// This is an enormous hack to keep remote introspection of older simulators working
+//   It works by interposing mach_msg, and redirecting message sent to a special port name. Messages to that portname will trigger a full set
+//   of sends to all kernel registered notifiers. In this mode mach_msg_sim_interposed() must return KERN_SUCCESS or the older dyld_sim may
+//   try to cleanup the notifer array.
+kern_return_t mach_msg_sim_interposed(	mach_msg_header_t* msg, mach_msg_option_t option, mach_msg_size_t send_size, mach_msg_size_t rcv_size,
+									  mach_port_name_t rcv_name, mach_msg_timeout_t timeout, mach_port_name_t notify) {
+	if (msg->msgh_remote_port != DYLD_PROCESS_INFO_NOTIFY_MAGIC) {
+		// Not the magic port, so just pass through to the real mach_msg()
+		return mach_msg(msg, option, send_size, rcv_size, rcv_name, timeout, notify);
+	}
+
+	// The magic port. We know dyld_sim is trying to message observers, so lets call into our messaging code directly.
+	// This is kind of weird since we effectively built a buffer in dyld_sim, then pass it to mach_msg, which we interpose, unpack, and then
+	// pass to send_message which then sends the buffer back out vis mach_message_overwrite(), but it should work at least as well as the old
+	// way.
+	RemoteNotificationResponder responder;
+	responder.sendMessage(msg->msgh_id, send_size, msg);
+
+	// We always return KERN_SUCCESS, otherwise old dyld_sims might clear the port
+	return KERN_SUCCESS;
+}
+
+static void notifyMonitoringDyld(RemoteNotificationResponder& responder, bool unloading, unsigned imageCount,
+								 const struct mach_header* loadAddresses[], const char* imagePaths[])
+{
+	// Make sure there is at least enough room to hold a the largest single file entry that can exist.
+	static_assert((MAXPATHLEN + sizeof(dyld_process_info_image_entry) + 1 + MAX_TRAILER_SIZE) <= DYLD_PROCESS_INFO_NOTIFY_MAX_BUFFER_SIZE);
+
+	unsigned entriesSize = imageCount*sizeof(dyld_process_info_image_entry);
+	unsigned pathsSize = 0;
+	for (unsigned j=0; j < imageCount; ++j) {
+		pathsSize += (strlen(imagePaths[j]) + 1);
+	}
+
+	unsigned totalSize = (sizeof(struct dyld_process_info_notify_header) + entriesSize + pathsSize + 127) & -128;   // align
+	// The reciever has a fixed buffer of DYLD_PROCESS_INFO_NOTIFY_MAX_BUFFER_SIZE, whcih needs to hold both the message and a trailer.
+	// If the total size exceeds that we need to fragment the message.
+	if ( (totalSize + MAX_TRAILER_SIZE) > DYLD_PROCESS_INFO_NOTIFY_MAX_BUFFER_SIZE ) {
+		// Putting all image paths into one message would make buffer too big.
+		// Instead split into two messages.  Recurse as needed until paths fit in buffer.
+		unsigned imageHalfCount = imageCount/2;
+		notifyMonitoringDyld(responder, unloading, imageHalfCount, loadAddresses, imagePaths);
+		notifyMonitoringDyld(responder, unloading, imageCount - imageHalfCount, &loadAddresses[imageHalfCount], &imagePaths[imageHalfCount]);
+		return;
+	}
+	uint8_t	buffer[totalSize + MAX_TRAILER_SIZE];
+	dyld_process_info_notify_header* header = (dyld_process_info_notify_header*)buffer;
+	header->version			= 1;
+	header->imageCount		= imageCount;
+	header->imagesOffset	= sizeof(dyld_process_info_notify_header);
+	header->stringsOffset	= sizeof(dyld_process_info_notify_header) + entriesSize;
+	header->timestamp		= dyld::gProcessInfo->infoArrayChangeTimestamp;
+	dyld_process_info_image_entry* entries = (dyld_process_info_image_entry*)&buffer[header->imagesOffset];
+	char* const pathPoolStart = (char*)&buffer[header->stringsOffset];
+	char* pathPool = pathPoolStart;
+	for (unsigned j=0; j < imageCount; ++j) {
+		strcpy(pathPool, imagePaths[j]);
+		uint32_t len = (uint32_t)strlen(pathPool);
+		bzero(entries->uuid, 16);
+		dyld3::MachOFile* mf = (dyld3::MachOFile*)loadAddresses[j];
+		mf->getUuid(entries->uuid);
+		entries->loadAddress = (uint64_t)loadAddresses[j];
+		entries->pathStringOffset = (uint32_t)(pathPool - pathPoolStart);
+		entries->pathLength  = len;
+		pathPool += (len +1);
+		++entries;
+	}
+	if (unloading) {
+		responder.sendMessage(DYLD_PROCESS_INFO_NOTIFY_UNLOAD_ID, totalSize, (mach_msg_header_t*)buffer);
+	} else {
+		responder.sendMessage(DYLD_PROCESS_INFO_NOTIFY_LOAD_ID, totalSize, (mach_msg_header_t*)buffer);
+	}
 }
 
 static void notifyMonitoringDyld(bool unloading, unsigned imageCount, const struct mach_header* loadAddresses[],
 								 const char* imagePaths[])
 {
 	dyld3::ScopedTimer(DBG_DYLD_REMOTE_IMAGE_NOTIFIER, 0, 0, 0);
-	for (int slot=0; slot < DYLD_MAX_PROCESS_INFO_NOTIFY_COUNT; ++slot) {
-		if ( dyld::gProcessInfo->notifyPorts[slot] == 0) continue;
-		unsigned entriesSize = imageCount*sizeof(dyld_process_info_image_entry);
-		unsigned pathsSize = 0;
-		for (unsigned j=0; j < imageCount; ++j) {
-			pathsSize += (strlen(imagePaths[j]) + 1);
-		}
-
-		unsigned totalSize = (sizeof(struct dyld_process_info_notify_header) + entriesSize + pathsSize + 127) & -128;   // align
-		// The reciever has a fixed buffer of DYLD_PROCESS_INFO_NOTIFY_MAX_BUFFER_SIZE, whcih needs to hold both the message and a trailer.
-		// If the total size exceeds that we need to fragment the message.
-		if ( (totalSize + MAX_TRAILER_SIZE) > DYLD_PROCESS_INFO_NOTIFY_MAX_BUFFER_SIZE ) {
-			// Putting all image paths into one message would make buffer too big.
-			// Instead split into two messages.  Recurse as needed until paths fit in buffer.
-			unsigned imageHalfCount = imageCount/2;
-			notifyMonitoringDyld(unloading, imageHalfCount, loadAddresses, imagePaths);
-			notifyMonitoringDyld(unloading, imageCount - imageHalfCount, &loadAddresses[imageHalfCount], &imagePaths[imageHalfCount]);
-			return;
-		}
-		uint8_t	buffer[totalSize + MAX_TRAILER_SIZE];
-		dyld_process_info_notify_header* header = (dyld_process_info_notify_header*)buffer;
-		header->version			= 1;
-		header->imageCount		= imageCount;
-		header->imagesOffset	= sizeof(dyld_process_info_notify_header);
-		header->stringsOffset	= sizeof(dyld_process_info_notify_header) + entriesSize;
-		header->timestamp		= dyld::gProcessInfo->infoArrayChangeTimestamp;
-		dyld_process_info_image_entry* entries = (dyld_process_info_image_entry*)&buffer[header->imagesOffset];
-		char* const pathPoolStart = (char*)&buffer[header->stringsOffset];
-		char* pathPool = pathPoolStart;
-		for (unsigned j=0; j < imageCount; ++j) {
-			strcpy(pathPool, imagePaths[j]);
-			uint32_t len = (uint32_t)strlen(pathPool);
-			bzero(entries->uuid, 16);
-			dyld3::MachOFile* mf = (dyld3::MachOFile*)loadAddresses[j];
-			mf->getUuid(entries->uuid);
-			entries->loadAddress = (uint64_t)loadAddresses[j];
-			entries->pathStringOffset = (uint32_t)(pathPool - pathPoolStart);
-			entries->pathLength  = len;
-			pathPool += (len +1);
-			++entries;
-		}
-		if (unloading) {
-			sendMessage(slot, DYLD_PROCESS_INFO_NOTIFY_UNLOAD_ID, totalSize, (mach_msg_header_t*)buffer, totalSize);
-		} else {
-			sendMessage(slot, DYLD_PROCESS_INFO_NOTIFY_LOAD_ID, totalSize, (mach_msg_header_t*)buffer, totalSize);
-		}
-	}
+	RemoteNotificationResponder responder;
+	if (!responder.active()) { return; }
+	notifyMonitoringDyld(responder, unloading, imageCount, loadAddresses, imagePaths);
 }
 
-static void notifyMonitoringDyldMain()
-{
+static void notifyMonitoringDyldMain() {
 	dyld3::ScopedTimer(DBG_DYLD_REMOTE_IMAGE_NOTIFIER, 0, 0, 0);
-	for (int slot=0; slot < DYLD_MAX_PROCESS_INFO_NOTIFY_COUNT; ++slot) {
-		if ( dyld::gProcessInfo->notifyPorts[slot] == 0) continue;
-		uint8_t buffer[sizeof(mach_msg_header_t) + MAX_TRAILER_SIZE];
-		sendMessage(slot, DYLD_PROCESS_INFO_NOTIFY_MAIN_ID, sizeof(mach_msg_header_t), (mach_msg_header_t*)buffer, sizeof(mach_msg_header_t) + MAX_TRAILER_SIZE);
-	}
+	RemoteNotificationResponder responder;
+	uint8_t buffer[sizeof(mach_msg_header_t) + MAX_TRAILER_SIZE];
+	responder.sendMessage(DYLD_PROCESS_INFO_NOTIFY_MAIN_ID, sizeof(mach_msg_header_t), (mach_msg_header_t*)buffer);
 }
 #else
 extern void notifyMonitoringDyldMain() VIS_HIDDEN;
@@ -1557,7 +1650,8 @@ void removeImage(ImageLoader* image)
 		const dyld3::MachOAnalyzer* ma = (const dyld3::MachOAnalyzer*)image->machHeader();
 		ma->forEachWeakDef(diag, ^(const char *symbolName, uint64_t imageOffset, bool isFromExportTrie) {
 			auto it = gLinkContext.weakDefMap.find(symbolName);
-			assert(it != gLinkContext.weakDefMap.end());
+			if ( it == gLinkContext.weakDefMap.end() )
+				return;
 			it->second = { nullptr, 0 };
 			if ( !isFromExportTrie ) {
 				// The string was already duplicated if we are an export trie
@@ -1609,7 +1703,15 @@ void runImageStaticTerminators(ImageLoader* image)
 
 static void terminationRecorder(ImageLoader* image)
 {
-	sImageFilesNeedingTermination.push_back(image);
+	bool add = true;
+#if __arm64e__
+	// <rdar://problem/71820555> Don't run static terminator for arm64e
+	const mach_header* mh = image->machHeader();
+	if ( (mh->cputype == CPU_TYPE_ARM64) && ((mh->cpusubtype & ~CPU_SUBTYPE_MASK) == CPU_SUBTYPE_ARM64E) )
+		add = false;
+#endif
+	if ( add )
+		sImageFilesNeedingTermination.push_back(image);
 }
 
 const char* getExecutablePath()
@@ -2143,6 +2245,9 @@ void processDyldEnvironmentVariable(const char* key, const char* value, const ch
 		sSharedCacheOverrideDir = value;
 	}
 	else if ( strcmp(key, "DYLD_USE_CLOSURES") == 0 ) {
+		// Handled elsewhere
+	}
+	else if ( strcmp(key, "DYLD_SHARED_REGION_DATA_CONST") == 0 ) {
 		// Handled elsewhere
 	}
 	else if ( strcmp(key, "DYLD_FORCE_INVALID_CACHE_CLOSURES") == 0 ) {
@@ -4374,7 +4479,8 @@ uintptr_t bindLazySymbol(const mach_header* mh, uintptr_t* lazyPointer)
 	#endif
 		if ( target == NULL )
 			throwf("image not found for lazy pointer at %p", lazyPointer);
-		result = target->doBindLazySymbol(lazyPointer, gLinkContext);
+		DyldSharedCache::DataConstLazyScopedWriter patcher(gLinkContext.dyldCache, mach_task_self(), gLinkContext.verboseMapping ? &dyld::log : nullptr);
+		result = target->doBindLazySymbol(lazyPointer, gLinkContext, patcher);
 	}
 	catch (const char* message) {
 		dyld::log("dyld: lazy symbol binding failed: %s\n", message);
@@ -4916,7 +5022,7 @@ static bool readFirstPage(const char* dylibPath, uint8_t firstPage[FIRST_PAGE_BU
 	if ( fileStartAsFat->magic == OSSwapBigToHostInt32(FAT_MAGIC) ) {
 		uint64_t fileOffset;
 		uint64_t fileLength;
-		if ( fatFindBest(fileStartAsFat, &fileOffset, &fileLength) ) {
+		if ( fatFindBest(fileStartAsFat, &fileOffset, &fileLength, file.getFileDescriptor()) ) {
 			if ( pread(file.getFileDescriptor(), firstPage, FIRST_PAGE_BUFFER_SIZE, fileOffset) != FIRST_PAGE_BUFFER_SIZE )
 				return false;
 		}
@@ -5349,7 +5455,7 @@ void notifyKernelAboutImage(const struct macho_header* mh, const char* fileInfo)
 #if TARGET_OS_OSX
 static void* getProcessInfo() { return dyld::gProcessInfo; }
 static const SyscallHelpers sSysCalls = {
-		13,
+		14,
 		// added in version 1
 		&open,
 		&close, 
@@ -5394,7 +5500,7 @@ static const SyscallHelpers sSysCalls = {
 		&getpid,
 		&mach_port_insert_right,
 		&mach_port_allocate,
-		&mach_msg,
+		&mach_msg_sim_interposed,
 		// Added in version 6
 		&abort_with_payload,
 		// Added in version 7
@@ -5420,9 +5526,11 @@ static const SyscallHelpers sSysCalls = {
 		&mach_msg_destroy,
 		&mach_port_construct,
 		&mach_port_destruct,
-		// Add in version 13
+		// Added in version 13
 		&fstat,
-		&vm_copy
+		&vm_copy,
+		// Added in version 14
+		&task_dyld_process_info_notify_get
 };
 
 __attribute__((noinline))
@@ -5722,6 +5830,29 @@ static bool envVarsMatch(const dyld3::closure::LaunchClosure* mainClosure, const
 	return true;
 }
 
+
+void getCDHashString(const uint8_t cdHash[20], char* cdHashBuffer) {
+	for (int i=0; i < 20; ++i) {
+		uint8_t byte = cdHash[i];
+		uint8_t nibbleL = byte & 0x0F;
+		uint8_t nibbleH = byte >> 4;
+		if ( nibbleH < 10 ) {
+			*cdHashBuffer = '0' + nibbleH;
+			++cdHashBuffer;
+		} else {
+			*cdHashBuffer = 'a' + (nibbleH-10);
+			++cdHashBuffer;
+		}
+		if ( nibbleL < 10 ) {
+			*cdHashBuffer = '0' + nibbleL;
+			++cdHashBuffer;
+		} else {
+			*cdHashBuffer = 'a' + (nibbleL-10);
+			++cdHashBuffer;
+		}
+	}
+}
+
 static bool closureValid(const dyld3::closure::LaunchClosure* mainClosure, const dyld3::closure::LoadedFileInfo& mainFileInfo,
 						 const uint8_t* mainExecutableCDHash, bool closureInCache, const char* envp[])
 {
@@ -5816,27 +5947,6 @@ static bool closureValid(const dyld3::closure::LaunchClosure* mainClosure, const
 
 	// If we found cd hashes, but they were all invalid, then print them out
 	if ( foundCDHash && !foundValidCDHash ) {
-		auto getCDHashString = [](const uint8_t cdHash[20], char* cdHashBuffer) {
-			for (int i=0; i < 20; ++i) {
-				uint8_t byte = cdHash[i];
-				uint8_t nibbleL = byte & 0x0F;
-				uint8_t nibbleH = byte >> 4;
-				if ( nibbleH < 10 ) {
-					*cdHashBuffer = '0' + nibbleH;
-					++cdHashBuffer;
-				} else {
-					*cdHashBuffer = 'a' + (nibbleH-10);
-					++cdHashBuffer;
-				}
-				if ( nibbleL < 10 ) {
-					*cdHashBuffer = '0' + nibbleL;
-					++cdHashBuffer;
-				} else {
-					*cdHashBuffer = 'a' + (nibbleL-10);
-					++cdHashBuffer;
-				}
-			}
-		};
 		if ( gLinkContext.verboseWarnings ) {
 			mainImage->forEachCDHash(^(const uint8_t *expectedHash, bool &stop) {
 				char mainExecutableCDHashBuffer[128] = { '\0' };
@@ -6026,8 +6136,14 @@ static bool launchWithClosure(const dyld3::closure::LaunchClosure* mainClosure,
 	mainClosure->libDyldEntry(dyldEntry);
 	const dyld3::LibDyldEntryVector* libDyldEntry = (dyld3::LibDyldEntryVector*)loader.resolveTarget(dyldEntry);
 
+	// Set the logging function first so that libdyld can log from inside all other entry vector functions
+#if !TARGET_OS_SIMULATOR
+	if ( libDyldEntry->vectorVersion > 3 )
+		libDyldEntry->setLogFunction(&dyld::vlog);
+#endif
+
 	// send info on all images to libdyld.dylb
-	libDyldEntry->setVars(mainExecutableMH, argc, argv, envp, apple, sKeysDisabled, sOnlyPlatformArm64e);
+	libDyldEntry->setVars(mainExecutableMH, argc, argv, envp, apple, sKeysDisabled, sOnlyPlatformArm64e, gEnableSharedCacheDataConst);
 #if TARGET_OS_OSX
 	uint32_t progVarsOffset;
 	if ( mainClosure->hasProgramVars(progVarsOffset) ) {
@@ -6056,17 +6172,14 @@ static bool launchWithClosure(const dyld3::closure::LaunchClosure* mainClosure,
 
 	if ( libDyldEntry->vectorVersion > 2 )
 		libDyldEntry->setChildForkFunction(&_dyld_fork_child);
-#if !TARGET_OS_SIMULATOR
-	if ( libDyldEntry->vectorVersion > 3 )
-		libDyldEntry->setLogFunction(&dyld::vlog);
-#endif
 	if ( libDyldEntry->vectorVersion >= 9 )
 		libDyldEntry->setLaunchMode(sLaunchModeUsed);
 
 
 	libDyldEntry->setOldAllImageInfo(gProcessInfo);
 	dyld3::LoadedImage* libSys = loader.findImage(mainClosure->libSystemImageNum());
-	libDyldEntry->setInitialImageList(mainClosure, dyldCache, sSharedCacheLoadInfo.path, allImages, *libSys);
+	libDyldEntry->setInitialImageList(mainClosure, dyldCache, sSharedCacheLoadInfo.path, allImages, *libSys,
+									  mach_task_self());
 	// run initializers
 	CRSetCrashLogMessage("dyld3: launch, running initializers");
 	libDyldEntry->runInitialzersBottomUp((mach_header*)mainExecutableMH);
@@ -6146,7 +6259,8 @@ static bool needsDyld2ErrorMessage(const char* msg)
 }
 
 // Note: buildLaunchClosure calls halt() if there is an error building the closure
-static const dyld3::closure::LaunchClosure* buildLaunchClosure(const uint8_t* mainExecutableCDHash,
+static const dyld3::closure::LaunchClosure* buildLaunchClosure(bool canUseClosureFromDisk,
+															   const uint8_t* mainExecutableCDHash,
 															   const dyld3::closure::LoadedFileInfo& mainFileInfo,
 															   const char* envp[],
 															   const dyld3::Array<uint8_t>& bootToken)
@@ -6163,7 +6277,7 @@ static const dyld3::closure::LaunchClosure* buildLaunchClosure(const uint8_t* ma
 	}
 
 	char closurePath[PATH_MAX];
-	bool canSaveClosureToDisk = !bootToken.empty() && dyld3::closure::LaunchClosure::buildClosureCachePath(mainFileInfo.path, envp, true, closurePath);
+	bool canSaveClosureToDisk = canUseClosureFromDisk && !bootToken.empty() && dyld3::closure::LaunchClosure::buildClosureCachePath(mainFileInfo.path, envp, true, closurePath);
 	dyld3::LaunchErrorInfo* errorInfo = (dyld3::LaunchErrorInfo*)&gProcessInfo->errorKind;
 	const dyld3::GradedArchs& archs = dyld3::GradedArchs::forCurrentOS(sKeysDisabled, sOnlyPlatformArm64e);
 	dyld3::closure::FileSystemPhysical fileSystem;
@@ -6249,16 +6363,57 @@ static const dyld3::closure::LaunchClosure* buildLaunchClosure(const uint8_t* ma
 		int fd = ::open_dprotected_np(closurePathTemp, O_WRONLY|O_CREAT, PROTECTION_CLASS_D, 0, S_IRUSR|S_IWUSR);
 #endif
 		if ( fd != -1 ) {
-			::ftruncate(fd, result->size());
-			::write(fd, result, result->size());
-			::fsetxattr(fd, DYLD_CLOSURE_XATTR_NAME, bootToken.begin(), bootToken.count(), 0, 0);
-			::fchmod(fd, S_IRUSR);
-			::close(fd);
-			::rename(closurePathTemp, closurePath);
-			// free built closure and mmap file() to reduce dirty memory
-			result->deallocate();
-			result = mapClosureFile(closurePath);
-			sLaunchModeUsed |= DYLD_LAUNCH_MODE_CLOSURE_SAVED_TO_FILE;
+			auto saveClosure = [&]() -> bool {
+				if ( ::ftruncate(fd, result->size()) == -1 ) {
+					if ( gLinkContext.verboseWarnings )
+						dyld::log("could not ftruncate closure (errno=%d) at: %s\n", errno, closurePathTemp);
+					return false;
+				}
+
+				ssize_t writeResult = ::write(fd, result, result->size());
+				if ( writeResult == -1 ) {
+					if ( gLinkContext.verboseWarnings )
+						dyld::log("could not write closure (errno=%d) at: %s\n", errno, closurePathTemp);
+					return false;
+				} else if ( writeResult != result->size() ) {
+					if ( gLinkContext.verboseWarnings )
+						dyld::log("could not write whole closure at: %s\n", closurePathTemp);
+					return false;
+				}
+
+				if ( ::fsetxattr(fd, DYLD_CLOSURE_XATTR_NAME, bootToken.begin(), bootToken.count(), 0, 0) == -1 ) {
+					if ( gLinkContext.verboseWarnings )
+						dyld::log("could not fsetxattr closure (errno=%d) at: %s\n", errno, closurePathTemp);
+					return false;
+				}
+
+				if ( ::fchmod(fd, S_IRUSR) == -1 ) {
+					if ( gLinkContext.verboseWarnings )
+						dyld::log("could not fchmod closure (errno=%d) at: %s\n", errno, closurePathTemp);
+					return false;
+				}
+
+				if ( ::close(fd) == -1 ) {
+					if ( gLinkContext.verboseWarnings )
+						dyld::log("could not close closure (errno=%d) at: %s\n", errno, closurePathTemp);
+					return false;
+				}
+
+				if ( ::rename(closurePathTemp, closurePath) == -1 ) {
+					if ( gLinkContext.verboseWarnings )
+						dyld::log("could not rename closure (errno=%d) from: %s to: %s\n", errno, closurePathTemp, closurePath);
+					return false;
+				}
+
+				return true;
+			};
+
+			if ( saveClosure() ) {
+				// free built closure and mmap file() to reduce dirty memory
+				result->deallocate();
+				result = mapClosureFile(closurePath);
+				sLaunchModeUsed |= DYLD_LAUNCH_MODE_CLOSURE_SAVED_TO_FILE;
+			}
 		}
 		else if ( gLinkContext.verboseWarnings ) {
 			dyld::log("could not save closure (errno=%d) to: %s\n", errno, closurePathTemp);
@@ -6524,6 +6679,35 @@ _main(const macho_header* mainExecutableMH, uintptr_t mainExecutableSlide,
 		}
 	}
 
+	// Check if we should force the shared cache __DATA_CONST to read-only or read-write
+	if ( dyld3::BootArgs::forceReadWriteDataConst() ) {
+		gEnableSharedCacheDataConst = false;
+	} else if ( dyld3::BootArgs::forceReadOnlyDataConst() ) {
+		gEnableSharedCacheDataConst = true;
+	} else {
+		// __DATA_CONST is enabled by default for arm64(e) for now
+#if __arm64__ && __LP64__
+		gEnableSharedCacheDataConst = true;
+#else
+		gEnableSharedCacheDataConst = false;
+#endif
+	}
+	bool sharedCacheDataConstIsEnabled = gEnableSharedCacheDataConst;
+
+	if ( dyld3::internalInstall() ) {
+		if (const char* dataConst = _simple_getenv(envp, "DYLD_SHARED_REGION_DATA_CONST")) {
+			if ( strcmp(dataConst, "RW") == 0 ) {
+				gEnableSharedCacheDataConst = false;
+			} else if ( strcmp(dataConst, "RO") == 0 ) {
+				gEnableSharedCacheDataConst = true;
+			} else {
+				dyld::warn("unknown option to DYLD_SHARED_REGION_DATA_CONST.  Valid options are: RW and RO\n");
+			}
+
+		}
+	}
+
+
 #if TARGET_OS_OSX
     if ( !gLinkContext.allowEnvVarsPrint && !gLinkContext.allowEnvVarsPath && !gLinkContext.allowEnvVarsSharedCache ) {
 		pruneEnvironmentVariables(envp, &apple);
@@ -6590,6 +6774,13 @@ _main(const macho_header* mainExecutableMH, uintptr_t mainExecutableSlide,
 #else
 		mapSharedCache(mainExecutableSlide);
 #endif
+
+		// If this process wants a different __DATA_CONST state from the shared region, then override that now
+		if ( (sSharedCacheLoadInfo.loadAddress != nullptr) && (gEnableSharedCacheDataConst != sharedCacheDataConstIsEnabled) ) {
+			uint32_t permissions = gEnableSharedCacheDataConst ? VM_PROT_READ : (VM_PROT_READ | VM_PROT_WRITE);
+			sSharedCacheLoadInfo.loadAddress->changeDataConstPermissions(mach_task_self(), permissions,
+																		 (gLinkContext.verboseMapping ? &dyld::log : nullptr));
+		}
 	}
 
 #if !TARGET_OS_SIMULATOR
@@ -6718,16 +6909,73 @@ _main(const macho_header* mainExecutableMH, uintptr_t mainExecutableSlide,
 
 		// We only want to try build a closure at runtime if its an iOS third party binary, or a macOS binary from the shared cache
 		bool allowClosureRebuilds = false;
-		if ( sClosureMode == ClosureMode::On ) {
+		if ( sJustBuildClosure ) {
+			// If sJustBuildClosure is set, always allow rebuilding
+			// In this case dyld will exit before using the closure
 			allowClosureRebuilds = true;
+		} else if ( sClosureMode == ClosureMode::On ) {
+			// Only rebuild shared cache closures on internal
+			if ( mainClosure != nullptr ) {
+				if ( dyld3::internalInstall() ) {
+					if ( gLinkContext.verboseWarnings )
+						dyld::log("dyld: allowing closure build as this is an internal OS\n");
+					allowClosureRebuilds = true;
+				} else {
+					if ( gLinkContext.verboseWarnings )
+						dyld::log("dyld: denying closure build as this is a customer OS\n");
+				}
+			} else {
+				// Always allow rebuilding on-disk closures
+				allowClosureRebuilds = true;
+			}
 		} else if ( (sClosureMode == ClosureMode::PreBuiltOnly) && (mainClosure != nullptr) ) {
-			allowClosureRebuilds = true;
+			// Only allow closure rebuilds on macOS if internal.  Customers should never have out-of-date closures as roots
+			// aren't used there.
+			if ( dyld3::internalInstall() ) {
+				if ( gLinkContext.verboseWarnings )
+					dyld::log("dyld: allowing closure build as this is an internal OS\n");
+				allowClosureRebuilds = true;
+			} else {
+				if ( gLinkContext.verboseWarnings )
+					dyld::log("dyld: denying closure build as this is a customer OS\n");
+			}
 		}
 
 		if ( (mainClosure != nullptr) && !closureValid(mainClosure, mainFileInfo, mainExecutableCDHash, true, envp) ) {
 			mainClosure = nullptr;
 			sLaunchModeUsed &= ~DYLD_LAUNCH_MODE_CLOSURE_FROM_OS;
 		}
+
+		// On customer devices, don't allow a binary with a shared cache prebuilt closure to find one on disk
+		bool canUseClosureFromDisk = true;
+		if ( (sSharedCacheLoadInfo.loadAddress != nullptr) && (mainExecutableCDHash != nullptr) ) {
+			char mainExecutableCDHashStringBuffer[128] = { '\0' };
+			strcat(mainExecutableCDHashStringBuffer, "/cdhash/");
+			getCDHashString(mainExecutableCDHash, mainExecutableCDHashStringBuffer + strlen("/cdhash/"));
+
+			const dyld3::closure::LaunchClosure* mainClosureByCDHash = sSharedCacheLoadInfo.loadAddress->findClosure(mainExecutableCDHashStringBuffer);
+
+		    if ( mainClosureByCDHash != nullptr ) {
+		 	   if ( dyld3::internalInstall() ) {
+		 		   if ( gLinkContext.verboseWarnings )
+		 			   dyld::log("dyld: allowing closure from disk on internal OS\n");
+		 	   } else {
+				   if ( mainClosure == nullptr ) {
+					   if ( gLinkContext.verboseWarnings )
+						   dyld::log("dyld: rejecting closure from disk on customer OS as shared cache closure was not used\n");
+				   }
+
+		 		   canUseClosureFromDisk = false;
+		 	   }
+			} else {
+				 // If we found a cache closure already, then we should have also found a cdHash for it
+				 if ( mainClosure != nullptr ) {
+					 if ( gLinkContext.verboseWarnings )
+						 dyld::log("dyld: somehow cache closure was found, but cdHash is not in cache lookup table\n");
+					 mainClosure = nullptr;
+				 }
+			}
+	    }
 
 		// <rdar://60333505> bootToken is a concat of boot-hash kernel passes down for app and dyld's uuid
 		uint8_t bootTokenBufer[128];
@@ -6743,11 +6991,11 @@ _main(const macho_header* mainExecutableMH, uintptr_t mainExecutableSlide,
 		// If we didn't find a valid cache closure then try build a new one
 		if ( (mainClosure == nullptr) && allowClosureRebuilds ) {
 			// if forcing closures, and no closure in cache, or it is invalid, check for cached closure
-			if ( !sForceInvalidSharedCacheClosureFormat )
+			if ( !sForceInvalidSharedCacheClosureFormat && canUseClosureFromDisk )
 				mainClosure = findCachedLaunchClosure(mainExecutableCDHash, mainFileInfo, envp, bootToken);
 			if ( mainClosure == nullptr ) {
 				// if  no cached closure found, build new one
-				mainClosure = buildLaunchClosure(mainExecutableCDHash, mainFileInfo, envp, bootToken);
+				mainClosure = buildLaunchClosure(canUseClosureFromDisk, mainExecutableCDHash, mainFileInfo, envp, bootToken);
 				if ( mainClosure != nullptr )
 					sLaunchModeUsed |= DYLD_LAUNCH_MODE_BUILT_CLOSURE_AT_LAUNCH;
 			}
@@ -6769,7 +7017,7 @@ _main(const macho_header* mainExecutableMH, uintptr_t mainExecutableSlide,
 											  mainExecutableSlide, argc, argv, envp, apple, diag, &result, startGlue, &closureOutOfDate, &recoverable);
 			if ( !launched && closureOutOfDate && allowClosureRebuilds ) {
 				// closure is out of date, build new one
-				mainClosure = buildLaunchClosure(mainExecutableCDHash, mainFileInfo, envp, bootToken);
+				mainClosure = buildLaunchClosure(canUseClosureFromDisk, mainExecutableCDHash, mainFileInfo, envp, bootToken);
 				if ( mainClosure != nullptr ) {
 					diag.clearError();
 					sLaunchModeUsed |= DYLD_LAUNCH_MODE_BUILT_CLOSURE_AT_LAUNCH;
